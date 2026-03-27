@@ -1,0 +1,40 @@
+version: '3.8'
+services:
+  user-service:
+    build: ./user-service
+    container_name: user-service
+    ports:
+      - "3001:3001"
+    restart: always
+
+  order-service:
+    build: ./order-service
+    container_name: order-service
+    ports:
+      - "3002:3002"
+    restart: always
+
+  payment-service:
+    build: ./payment-service
+    container_name: payment-service
+    ports:
+      - "3003:3003"
+    restart: always
+
+  gateway-service:
+    build: ./gateway-service
+    container_name: gateway-service
+    ports:
+      - "3000:3000"
+    restart: always
+
+  log-collector:
+    build: ./log-collector
+    container_name: log-collector
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - user-service
+      - order-service
+      - payment-service
+      - gateway-service

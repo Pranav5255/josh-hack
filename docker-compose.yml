@@ -61,6 +61,23 @@ services:
     restart: always
 
   # ---------------------------------------------------------------------------
+  # Mail — Resend API (preferred) or Gmail SMTP; dashboard POSTs /send-alert when MAILER_URL is set
+  # ---------------------------------------------------------------------------
+  mail-service:
+    build: ./mail-service
+    container_name: mail-service
+    environment:
+      - PORT=4100
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - RESEND_FROM=${RESEND_FROM:-}
+      - EMAIL_USER=${EMAIL_USER:-}
+      - EMAIL_PASS=${EMAIL_PASS:-}
+      - MAILER_INTERNAL_TOKEN=${MAILER_INTERNAL_TOKEN:-}
+    expose:
+      - "4100"
+    restart: always
+
+  # ---------------------------------------------------------------------------
   # AI Engine — LangGraph failure detection and recovery brain
   # Replaces ai-service entirely. Consumes logs_queue via consumer.py and
   # runs the full incident response pipeline (classify → analyze → execute → verify).
@@ -98,9 +115,12 @@ services:
       - DASHBOARD_HOST=0.0.0.0
       - DASHBOARD_PORT=4000
       - ANALYSIS_COOLDOWN=${ANALYSIS_COOLDOWN:-45}
-      # Email alerts — recipients are managed dynamically from the frontend UI
+      # Email — optional nodemailer sidecar (set both to use mail-service instead of in-process SMTP)
+      - MAILER_URL=${MAILER_URL:-http://mail-service:4100}
+      - MAILER_INTERNAL_TOKEN=${MAILER_INTERNAL_TOKEN:-}
       - EMAIL_USER=${EMAIL_USER:-}
       - EMAIL_PASS=${EMAIL_PASS:-}
+      - EMAIL_ALERT_RECIPIENTS=${EMAIL_ALERT_RECIPIENTS:-}
       # Stream ai_engine loggers to Socket.IO (agent/state/tools)
       - AI_ENGINE_LOG_TO_UI=${AI_ENGINE_LOG_TO_UI:-true}
       - MAX_AI_ENGINE_LOGS=${MAX_AI_ENGINE_LOGS:-300}
@@ -117,6 +137,7 @@ services:
     depends_on:
       - rabbitmq
       - log-collector
+      - mail-service
     restart: always
 
   # ---------------------------------------------------------------------------

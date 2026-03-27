@@ -39,6 +39,7 @@ function App() {
   const [rcaEvents, setRcaEvents] = useState([]);
   const [selectedService, setSelectedService] = useState(null);
   const [alertEmails, setAlertEmails] = useState([]);
+  const [envAlertEmails, setEnvAlertEmails] = useState([]);
   const [emailInput, setEmailInput] = useState('');
   const [emailError, setEmailError] = useState('');
 
@@ -49,6 +50,7 @@ function App() {
       if (state.services) setServices(state.services);
       if (state.rcaEvents) setRcaEvents(state.rcaEvents);
       if (state.alertEmails) setAlertEmails(state.alertEmails);
+      if (state.envAlertEmails) setEnvAlertEmails(state.envAlertEmails);
     };
 
     const onNewLog = (logObj) => {
@@ -104,7 +106,7 @@ function App() {
       setTimeout(() => setEmailError(''), 3000);
       return;
     }
-    if (alertEmails.includes(trimmed)) {
+    if (alertEmails.includes(trimmed) || envAlertEmails.includes(trimmed)) {
       setEmailError('This email is already in the list');
       setTimeout(() => setEmailError(''), 3000);
       return;
@@ -286,12 +288,13 @@ function App() {
                 <div className="email-card-header">
                   <Mail size={18} className="email-card-icon" />
                   <h3 style={{margin: 0}}>Email Alerts</h3>
-                  {alertEmails.length > 0 && (
-                    <span className="email-count-badge">{alertEmails.length}</span>
+                  {(alertEmails.length + envAlertEmails.length) > 0 && (
+                    <span className="email-count-badge">{alertEmails.length + envAlertEmails.length}</span>
                   )}
                 </div>
                 <p className="email-card-subtitle">
-                  Receive an email whenever the AI detects and handles a failure.
+                  Receive an email when the AI handles a failure or when analysis crashes. Add recipients here, or set
+                  {' '}<code className="email-env-code">EMAIL_ALERT_RECIPIENTS</code> in the server environment.
                 </p>
 
                 {/* Add email input */}
@@ -314,6 +317,19 @@ function App() {
                   <p className="email-error">{emailError}</p>
                 )}
 
+                {envAlertEmails.length > 0 && (
+                  <>
+                    <p className="email-env-label">From environment (not editable here)</p>
+                    <ul className="email-list email-list-env">
+                      {envAlertEmails.map((email) => (
+                        <li key={`env-${email}`} className="email-list-item email-list-item-static">
+                          <span className="email-address">{email}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  </>
+                )}
+
                 {/* Registered recipients */}
                 {alertEmails.length > 0 ? (
                   <ul className="email-list">
@@ -331,7 +347,11 @@ function App() {
                     ))}
                   </ul>
                 ) : (
-                  <p className="email-empty">No recipients yet. Add one above.</p>
+                  <p className="email-empty">
+                    {envAlertEmails.length > 0
+                      ? 'No dashboard-added recipients. Environment addresses above still receive alerts.'
+                      : 'No recipients yet. Add one above or configure EMAIL_ALERT_RECIPIENTS.'}
+                  </p>
                 )}
               </div>
 

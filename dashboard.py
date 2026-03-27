@@ -2,13 +2,13 @@
 #
 # Integration only — no AI logic lives here.
 # Serves Socket.IO on port 4000 for the React app. Legacy Node `ai-service/` is not
-# used by this stack — do not integrate it.
+# used by this stack. Optional `mail-service/` (Resend or Gmail) sends mail when MAILER_URL is set.
 #
 # Events emitted to frontend:
-#   initial_state     {logs, services, rcaEvents, alertEmails, aiEngineLogs}  on connect
+#   initial_state     {logs, services, rcaEvents, alertEmails, envAlertEmails, aiEngineLogs}  on connect
 #   new_log           raw log object from log-collector          per RabbitMQ message
 #   status_update     {service: {status, exitCode, lastSeen}}   per RabbitMQ message
-#   rca_event         {service, rca, command, timestamp}         after ai_engine analysis
+#   rca_event         {service, rca, command, timestamp, alert_kind?}  after analysis or on analysis exception
 #   ai_engine_log     {timestamp, logger, level, message, exc_info?}  from ai_engine loggers
 #   email_list_update {emails: [...]}                            after add/remove
 #
@@ -16,13 +16,17 @@
 #   add_email    {email: "user@example.com"}
 #   remove_email {email: "user@example.com"}
 
+import html
 import json
 import logging
+import traceback
 from collections import deque
 import os
 import smtplib
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -62,9 +66,34 @@ COOLDOWN_SECONDS = int(os.getenv("ANALYSIS_COOLDOWN", "45"))
 RETRY_DELAY      = 5
 RETRY_DELAY_MAX  = 30
 
-# Email — sender credentials read from env; recipients are managed dynamically
+# Email — sender credentials read from env; recipients = env list + dashboard UI list
 EMAIL_USER = os.getenv("EMAIL_USER", "")
 EMAIL_PASS = os.getenv("EMAIL_PASS", "")
+# Optional nodemailer sidecar (see mail-service/): when set, dashboard POSTs instead of smtplib
+MAILER_URL = (os.getenv("MAILER_URL") or "").strip()
+MAILER_INTERNAL_TOKEN = (os.getenv("MAILER_INTERNAL_TOKEN") or "").strip()
+
+
+def _parse_env_alert_recipients(raw: str | None) -> list:
+    """Comma-separated emails from EMAIL_ALERT_RECIPIENTS; order preserved, deduped."""
+    if not raw:
+        return []
+    out: list = []
+    for part in raw.split(","):
+        e = part.strip().lower()
+        if e and "@" in e:
+            out.append(e)
+    return list(dict.fromkeys(out))
+
+
+EMAIL_ALERT_RECIPIENTS = _parse_env_alert_recipients(os.getenv("EMAIL_ALERT_RECIPIENTS", ""))
+
+
+def _all_alert_recipients() -> list:
+    """Union of EMAIL_ALERT_RECIPIENTS and Socket.IO dashboard list (env first, deduped)."""
+    with _emails_lock:
+        ui = list(_alert_emails)
+    return list(dict.fromkeys([*EMAIL_ALERT_RECIPIENTS, *ui]))
 
 # Stream ai_engine (agent/state/tools) log records to Socket.IO + initial_state buffer
 AI_ENGINE_LOG_TO_UI = os.getenv("AI_ENGINE_LOG_TO_UI", "true").lower() == "true"
@@ -190,6 +219,7 @@ def _on_connect():
         }
     with _emails_lock:
         snapshot["alertEmails"] = list(_alert_emails)
+    snapshot["envAlertEmails"] = list(EMAIL_ALERT_RECIPIENTS)
     with _ai_engine_logs_lock:
         snapshot["aiEngineLogs"] = list(_ai_engine_logs)
 
@@ -235,51 +265,109 @@ def _on_remove_email(data):
 # ---------------------------------------------------------------------------
 # Email alerting
 # ---------------------------------------------------------------------------
-def _send_email_alert(rca_event: dict) -> None:
-    """Send an HTML email alert to all registered recipients."""
-    if not EMAIL_USER or not EMAIL_PASS:
-        logger.debug("Email not configured (EMAIL_USER/EMAIL_PASS not set) — skipping alert")
+def _send_email_via_mailer(recipients: list, rca_event: dict) -> None:
+    """POST to mail-service (nodemailer) with shared token."""
+    if not MAILER_INTERNAL_TOKEN:
+        logger.warning("MAILER_URL is set but MAILER_INTERNAL_TOKEN is empty — skipping email")
         return
+    url = MAILER_URL.rstrip("/") + "/send-alert"
+    payload = json.dumps({"recipients": recipients, "rca_event": rca_event}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/json; charset=utf-8",
+            "X-Internal-Token": MAILER_INTERNAL_TOKEN,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = resp.read()
+            code = getattr(resp, "status", None) or resp.getcode()
+            if code != 200:
+                logger.error("mail-service returned HTTP %s", code)
+                return
+        logger.info("Email alert sent via mail-service to: %s", ", ".join(recipients))
+    except urllib.error.HTTPError as exc:
+        err_body = exc.read().decode("utf-8", errors="replace")
+        logger.error("mail-service HTTP %s: %s", exc.code, err_body[:500])
+    except Exception as exc:
+        logger.error("mail-service request failed: %s", exc)
 
-    with _emails_lock:
-        recipients = list(_alert_emails)
 
-    if not recipients:
-        logger.debug("No alert emails registered — skipping email")
-        return
-
+def _send_email_smtp(recipients: list, rca_event: dict) -> None:
+    """Send using Gmail SMTP in-process (used when MAILER_URL is unset)."""
     service   = rca_event.get("service", "unknown")
     rca       = rca_event.get("rca", "")
     command   = rca_event.get("command", "")
     timestamp = rca_event.get("timestamp", datetime.now().isoformat())
+    kind      = rca_event.get("alert_kind", "failure")
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"\U0001f6a8 Alert: Failure detected in {service}"
-    msg["From"]    = EMAIL_USER
-    msg["To"]      = ", ".join(recipients)
+    esc_svc = html.escape(service, quote=True)
+    esc_cmd = html.escape(command, quote=True)
+    esc_rca = html.escape(rca, quote=True)
 
-    text_body = (
-        f"Microservice Alert: {service}\n\n"
-        f"Root Cause Analysis:\n{rca}\n\n"
-        f"Healing Command Executed:\n{command}\n\n"
-        f"Time: {timestamp}"
-    )
+    if kind == "analysis_error":
+        title_plain = f"Analysis failed for {service}"
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"\U0001f6a8 Alert: {title_plain}"
+        msg["From"]    = EMAIL_USER
+        msg["To"]      = ", ".join(recipients)
+        text_body = (
+            f"AI analysis error: {service}\n\n"
+            f"Details:\n{rca}\n\n"
+            f"Command line (not executed):\n{command}\n\n"
+            f"Time: {timestamp}"
+        )
+        html_body = f"""
+    <div style="font-family: Inter, system-ui, sans-serif; max-width: 600px; margin: auto;">
+      <div style="background: #92400e; color: white; padding: 20px 24px; border-radius: 8px 8px 0 0;">
+        <h2 style="margin:0;">\U0001f6a8 AI analysis failed: {esc_svc}</h2>
+      </div>
+      <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
+        <h3 style="color: #111827; margin-bottom: 8px;">Details</h3>
+        <pre style="background: #1f2937; color: #fde68a; padding: 12px 16px; border-radius: 6px;
+                    font-size: 12px; overflow-x: auto; white-space: pre-wrap;">{esc_rca}</pre>
 
-    html_body = f"""
+        <h3 style="color: #111827; margin-top: 20px; margin-bottom: 8px;">Healing command</h3>
+        <pre style="background: #1f2937; color: #a7f3d0; padding: 12px 16px; border-radius: 6px;
+                    font-size: 13px; overflow-x: auto;">{esc_cmd}</pre>
+
+        <p style="margin-top: 20px; font-size: 12px; color: #9ca3af;">
+          Time: {html.escape(timestamp, quote=True)}
+        </p>
+      </div>
+    </div>
+    """
+    else:
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"\U0001f6a8 Alert: Failure detected in {service}"
+        msg["From"]    = EMAIL_USER
+        msg["To"]      = ", ".join(recipients)
+
+        text_body = (
+            f"Microservice Alert: {service}\n\n"
+            f"Root Cause Analysis:\n{rca}\n\n"
+            f"Healing Command Executed:\n{command}\n\n"
+            f"Time: {timestamp}"
+        )
+
+        html_body = f"""
     <div style="font-family: Inter, system-ui, sans-serif; max-width: 600px; margin: auto;">
       <div style="background: #1e5631; color: white; padding: 20px 24px; border-radius: 8px 8px 0 0;">
-        <h2 style="margin:0;">\U0001f6a8 Microservice Alert: {service}</h2>
+        <h2 style="margin:0;">\U0001f6a8 Microservice Alert: {esc_svc}</h2>
       </div>
       <div style="background: #f9fafb; padding: 24px; border: 1px solid #e5e7eb; border-top: none; border-radius: 0 0 8px 8px;">
         <h3 style="color: #111827; margin-bottom: 8px;">Root Cause Analysis</h3>
-        <p style="color: #374151; line-height: 1.6;">{rca}</p>
+        <p style="color: #374151; line-height: 1.6; white-space: pre-wrap;">{esc_rca}</p>
 
         <h3 style="color: #111827; margin-top: 20px; margin-bottom: 8px;">Healing Command Executed</h3>
         <pre style="background: #1f2937; color: #a7f3d0; padding: 12px 16px; border-radius: 6px;
-                    font-size: 13px; overflow-x: auto;">{command}</pre>
+                    font-size: 13px; overflow-x: auto;">{esc_cmd}</pre>
 
         <p style="margin-top: 20px; font-size: 12px; color: #9ca3af;">
-          Detected at: {timestamp}
+          Detected at: {html.escape(timestamp, quote=True)}
         </p>
       </div>
     </div>
@@ -295,6 +383,26 @@ def _send_email_alert(rca_event: dict) -> None:
         logger.info("Email alert sent to: %s", ", ".join(recipients))
     except Exception as exc:
         logger.error("Email send failed: %s", exc)
+
+
+def _send_email_alert(rca_event: dict) -> None:
+    """Send an HTML email alert to env + dashboard recipients (mailer sidecar or SMTP)."""
+    recipients = _all_alert_recipients()
+    if not recipients:
+        logger.warning(
+            "Alert email skipped: no recipients (add emails in dashboard UI and/or EMAIL_ALERT_RECIPIENTS)",
+        )
+        return
+
+    if MAILER_URL:
+        _send_email_via_mailer(recipients, rca_event)
+        return
+
+    if not EMAIL_USER or not EMAIL_PASS:
+        logger.warning("Alert email skipped: EMAIL_USER/EMAIL_PASS not set (MAILER_URL is empty)")
+        return
+
+    _send_email_smtp(recipients, rca_event)
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +508,24 @@ def _run_analysis(logobj: dict) -> None:
         _send_email_alert(rca_event)
 
     except Exception as exc:
-        logger.error("Analysis failed for %s: %s", service, exc)
+        logger.error("Analysis failed for %s: %s", service, exc, exc_info=True)
+        tb = traceback.format_exc()
+        if len(tb) > 6000:
+            tb = tb[:6000] + "\n... (truncated)"
+        detail = f"Exception: {exc!r}\n\nTraceback:\n{tb}"
+        failure_event = {
+            "service":   service,
+            "rca":       detail,
+            "command":   "# Analysis did not complete — no healing command was executed",
+            "timestamp": datetime.now().isoformat(),
+            "alert_kind": "analysis_error",
+        }
+        with _state_lock:
+            _state["rcaEvents"].insert(0, failure_event)
+            if len(_state["rcaEvents"]) > MAX_RCA:
+                _state["rcaEvents"].pop()
+        _emit_to_all_clients("rca_event", failure_event)
+        _send_email_alert(failure_event)
 
 
 # ---------------------------------------------------------------------------
@@ -478,7 +603,10 @@ def _consume_loop() -> None:
 # Entry point
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    email_status = f"sender={EMAIL_USER}" if EMAIL_USER else "not configured"
+    if MAILER_URL:
+        email_status = f"mailer={MAILER_URL}"
+    else:
+        email_status = f"sender={EMAIL_USER}" if EMAIL_USER else "not configured (set MAILER_URL or EMAIL_USER)"
     logger.info(
         "Starting dashboard (port=%d, dry_run=%s, cooldown=%ds, email=%s)",
         DASHBOARD_PORT, DRY_RUN, COOLDOWN_SECONDS, email_status,

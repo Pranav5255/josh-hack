@@ -99,7 +99,6 @@ def restart_service(service: str, dry_run: bool = False) -> ToolResult:
 
     ok, out, err = _run(f"{_docker_bin()} restart {service}", timeout=60, dry_run=dry_run)
     if not ok:
-        logger.warning("docker restart failed service=%s err=%r out=%r", service, err, out)
         return ToolResult(False, "restart_service", service, time.time() - t0, error=err or out or "docker restart failed")
 
     time.sleep(3)
@@ -171,10 +170,6 @@ def rollback_deployment(service: str, dry_run: bool = False) -> ToolResult:
         timeout=90, dry_run=dry_run,
     )
     if not ok:
-        logger.warning(
-            "rollback docker-compose failed service=%s err=%r out=%r",
-            service, err, out,
-        )
         return ToolResult(
             False, "rollback_deployment", service, time.time() - t0,
             error=err or out or "rollback failed",
@@ -203,11 +198,6 @@ def scale_replicas(service: str, replicas: int = 3, dry_run: bool = False) -> To
         f"{_compose_bin()} up -d --scale {service}={replicas}",
         timeout=60, dry_run=dry_run,
     )
-    if not ok:
-        logger.warning(
-            "scale_replicas failed service=%s err=%r out=%r",
-            service, err, out,
-        )
 
     return ToolResult(
         success=ok,

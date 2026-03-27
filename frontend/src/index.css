@@ -290,7 +290,15 @@ body {
 .rca-header { display: flex; justify-content: space-between; margin-bottom: 0.5rem; }
 .rca-service { font-size: 0.75rem; font-weight: 600; color: #dc2626; }
 .rca-time { font-size: 0.7rem; color: var(--text-muted); }
-.rca-desc { font-size: 0.8rem; margin-bottom: 0.5rem; line-height: 1.4; }
+.rca-desc {
+  font-size: 0.8rem;
+  margin-bottom: 0.5rem;
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 240px;
+  overflow-y: auto;
+}
 .rca-command {
   display: block;
   font-family: monospace;
@@ -328,6 +336,34 @@ body {
   color: var(--text-muted);
   margin-bottom: 1rem;
   line-height: 1.5;
+}
+
+.email-env-code {
+  font-size: 0.7rem;
+  background: #f3f4f6;
+  padding: 1px 4px;
+  border-radius: 4px;
+  color: var(--text-main);
+}
+
+.email-env-label {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  margin: 0 0 0.35rem 0;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.email-list-env {
+  margin-top: 0;
+  margin-bottom: 0.75rem;
+}
+
+.email-list-item-static {
+  justify-content: flex-start;
+  background: #eef2ff;
+  border: 1px solid #c7d2fe;
 }
 
 .email-input-row {

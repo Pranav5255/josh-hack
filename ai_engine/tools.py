@@ -6,8 +6,10 @@ import logging
 import os
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 try:
     from .state import StateManager, IncidentStatus, Incident, FailureType
@@ -25,6 +27,45 @@ def _docker_bin() -> str:
 def _compose_bin() -> str:
     """docker-compose v1 binary (separate from static docker client)."""
     return os.environ.get("DOCKER_COMPOSE_BIN", "docker-compose")
+
+
+def _code_heal_root() -> str:
+    return os.path.abspath(os.environ.get("CODE_HEAL_ROOT", "/buggy-live"))
+
+
+def _code_heal_allowed_filenames() -> List[str]:
+    raw = os.environ.get("CODE_HEAL_FILES", "app.py")
+    return [p.strip().lstrip("/\\") for p in raw.split(",") if p.strip()]
+
+
+def _code_heal_service_names() -> List[str]:
+    raw = os.environ.get("CODE_HEAL_SERVICES", "buggy-service")
+    return [s.strip() for s in raw.split(",") if s.strip()]
+
+
+def _code_heal_max_bytes() -> int:
+    try:
+        return int(os.environ.get("CODE_HEAL_MAX_BYTES", "262144"))
+    except ValueError:
+        return 262144
+
+
+def _resolve_code_heal_path(rel_path: str) -> Tuple[str, Optional[str]]:
+    """Return (absolute_path, error_message). rel_path must stay under CODE_HEAL_ROOT."""
+    if not rel_path or not str(rel_path).strip():
+        return "", "empty path"
+    rel = str(rel_path).strip().replace("\\", "/").lstrip("/")
+    if ".." in rel.split("/"):
+        return "", "path traversal not allowed"
+    allowed = _code_heal_allowed_filenames()
+    if allowed and rel not in allowed:
+        return "", f"path not in CODE_HEAL_FILES allowlist: {rel!r}"
+    root = _code_heal_root()
+    full = os.path.abspath(os.path.join(root, rel))
+    root_real = os.path.abspath(root)
+    if not full.startswith(root_real + os.sep) and full != root_real:
+        return "", f"path escapes CODE_HEAL_ROOT: {rel!r}"
+    return full, None
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +251,161 @@ def scale_replicas(service: str, replicas: int = 3, dry_run: bool = False) -> To
     )
 
 
+def read_file(service: str, path: str, dry_run: bool = False, **kwargs) -> ToolResult:
+    """Read a file under CODE_HEAL_ROOT (allowlisted relative paths only)."""
+    t0 = time.time()
+    full, err = _resolve_code_heal_path(path)
+    if err:
+        return ToolResult(False, "read_file", service, time.time() - t0, error=err)
+    if dry_run:
+        return ToolResult(
+            True, "read_file", service, time.time() - t0,
+            message=f"[dry-run] read {path}",
+            output=full,
+        )
+    try:
+        with open(full, encoding="utf-8") as f:
+            data = f.read()
+    except OSError as exc:
+        return ToolResult(False, "read_file", service, time.time() - t0, error=str(exc))
+    return ToolResult(
+        True, "read_file", service, time.time() - t0,
+        message=f"Read {len(data)} chars from {path}",
+        output=data[:10000],
+    )
+
+
+_RUN_CMD_ALLOWED_PREFIXES = ("sed -i ", "python -c ", "cp ")
+
+
+def run_cmd(service: str, cmd: str, dry_run: bool = False, **kwargs) -> ToolResult:
+    """Run a single allowlisted shell command (strict prototype — no arbitrary shell)."""
+    t0 = time.time()
+    c = (cmd or "").strip()
+    if not c:
+        return ToolResult(False, "run_cmd", service, time.time() - t0, error="empty command")
+    if len(c) > 1200:
+        return ToolResult(False, "run_cmd", service, time.time() - t0, error="command too long")
+    if not any(c.startswith(p) for p in _RUN_CMD_ALLOWED_PREFIXES):
+        return ToolResult(
+            False, "run_cmd", service, time.time() - t0,
+            error=f"command must start with one of: {_RUN_CMD_ALLOWED_PREFIXES}",
+        )
+    ok, out, err = _run(c, timeout=60, dry_run=dry_run)
+    return ToolResult(
+        success=ok,
+        tool_name="run_cmd",
+        service=service,
+        duration_seconds=time.time() - t0,
+        message="run_cmd completed" if ok else "run_cmd failed",
+        output=(out or "")[:8000],
+        error=err if not ok else None,
+    )
+
+
+def fix_code(service: str, dry_run: bool = False, **kwargs) -> ToolResult:
+    """Write full file content under CODE_HEAL_ROOT, then docker restart service to reload."""
+    t0 = time.time()
+    fix_file = kwargs.get("fix_file") or kwargs.get("fix_path")
+    content = kwargs.get("fix_file_content")
+    if content is None:
+        content = kwargs.get("content")
+    if not fix_file or content is None:
+        return ToolResult(
+            False, "fix_code", service, time.time() - t0,
+            error="fix_file and fix_file_content are required",
+        )
+    full, err = _resolve_code_heal_path(str(fix_file))
+    if err:
+        return ToolResult(False, "fix_code", service, time.time() - t0, error=err)
+    raw = content if isinstance(content, str) else str(content)
+    if not str(raw).strip():
+        return ToolResult(
+            False, "fix_code", service, time.time() - t0,
+            error="fix_file_content is empty — LLM must return full file or code_context must be loaded",
+        )
+    mx = _code_heal_max_bytes()
+    if len(raw.encode("utf-8")) > mx:
+        return ToolResult(
+            False, "fix_code", service, time.time() - t0,
+            error=f"fix_file_content exceeds {mx} bytes",
+        )
+    if dry_run:
+        logger.info("[DRY RUN] would write %d bytes to %s", len(raw), full)
+        return ToolResult(
+            True, "fix_code", service, time.time() - t0,
+            message=f"[dry-run] would write {fix_file}",
+            output=full,
+        )
+    try:
+        os.makedirs(os.path.dirname(full) or ".", exist_ok=True)
+        with open(full, "w", encoding="utf-8", newline="\n") as f:
+            f.write(raw)
+    except OSError as exc:
+        return ToolResult(False, "fix_code", service, time.time() - t0, error=str(exc))
+
+    ok, out, err = _run(f"{_docker_bin()} restart {service}", timeout=90, dry_run=False)
+    if not ok:
+        return ToolResult(
+            False, "fix_code", service, time.time() - t0,
+            error=err or out or "docker restart failed after write",
+            output=out,
+        )
+    time.sleep(3)
+    healthy = _verify_service_health(service, dry_run=False)
+    return ToolResult(
+        success=healthy,
+        tool_name="fix_code",
+        service=service,
+        duration_seconds=time.time() - t0,
+        message=f"Wrote {fix_file} and restarted {service}" if healthy else "File written but health check failed",
+        output=out,
+        error=None if healthy else "Post-fix health check failed",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Health-check / Critic helpers
 # ---------------------------------------------------------------------------
+
+def _http_health_check(
+    url: str,
+    dry_run: bool = False,
+    retries: int = 6,
+    delay_sec: float = 2.0,
+) -> bool:
+    """GET url; retry while Flask restarts after docker restart (avoids flaky verify)."""
+    if dry_run:
+        return True
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                if resp.getcode() == 200:
+                    if attempt > 0:
+                        logger.info("HTTP health %s: PASS on attempt %d", url, attempt + 1)
+                    return True
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            last_exc = exc
+            logger.info("HTTP health %s: attempt %d/%d FAIL (%s)", url, attempt + 1, retries, exc)
+        if attempt < retries - 1:
+            time.sleep(delay_sec)
+    logger.info("HTTP health %s: FAIL after %d attempts (%s)", url, retries, last_exc)
+    return False
+
+
+def _verify_service_health(service: str, dry_run: bool = False) -> bool:
+    """Docker ps for normal services; HTTP GET for code-heal services when URL is set."""
+    names = _code_heal_service_names()
+    if service in names:
+        url = (os.environ.get("BUGGY_SERVICE_HEALTH_URL") or "").strip()
+        if url:
+            ok = _http_health_check(url, dry_run=dry_run)
+            logger.info("Code-heal HTTP verify %s → %s", url, "PASS" if ok else "FAIL")
+            return ok
+    return _health_check(service, dry_run=dry_run)
+
 
 def _health_check(service: str, dry_run: bool = False) -> bool:
     """Check that a docker container is running."""
@@ -248,6 +441,9 @@ TOOL_REGISTRY = {
     "check_logs":          check_logs,
     "rollback_deployment": rollback_deployment,
     "scale_replicas":      scale_replicas,
+    "read_file":           read_file,
+    "run_cmd":             run_cmd,
+    "fix_code":            fix_code,
 }
 
 # Failure-type -> preferred action mapping
@@ -267,6 +463,10 @@ ACTION_MAP: Dict[str, Dict] = {
     FailureType.ERROR_LOGS.value: {
         "primary":  "restart_service",
         "fallback": "rollback_deployment",
+    },
+    FailureType.CODE_HEAL.value: {
+        "primary":  "fix_code",
+        "fallback": "restart_service",
     },
 }
 
@@ -350,7 +550,7 @@ class ToolManager:
     # ------------------------------------------------------------------
     def verify_and_close(self, incident_id: str, service: str) -> bool:
         """Post-action health check. Returns True if service is healthy."""
-        healthy = _health_check(service, dry_run=self.dry_run)
+        healthy = _verify_service_health(service, dry_run=self.dry_run)
         if healthy:
             self.state_manager.update_incident(
                 incident_id,

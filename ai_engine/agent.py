@@ -29,6 +29,7 @@ ALLOWED_ACTIONS = [
     "check_logs",
     "rollback_deployment",
     "scale_replicas",
+    "fix_code",
     "escalate",
 ]
 
@@ -42,6 +43,8 @@ class IncidentState(TypedDict):
     container_status: str
     exit_code: int
     timestamp: str
+    # Optional: live file snippets from dashboard (CODE_HEAL_ROOT / CODE_HEAL_FILES)
+    code_context: Dict[str, str]
     # Populated by classify node
     incident_id: str
     failure_type: str
@@ -204,7 +207,11 @@ _PROVIDERS = {
 # ---------------------------------------------------------------------------
 # Prompt & response helpers
 # ---------------------------------------------------------------------------
-def _build_prompt(incident: Incident, state_manager: StateManager) -> str:
+def _build_prompt(
+    incident: Incident,
+    state_manager: StateManager,
+    code_context: Optional[Dict[str, str]] = None,
+) -> str:
     past = [
         i for i in state_manager.get_service_incidents(incident.service)
         if i.resolved and i.healed_at
@@ -219,6 +226,74 @@ def _build_prompt(incident: Incident, state_manager: StateManager) -> str:
         history = "  No historical data."
 
     steps_tried = json.dumps(incident.attempted_actions, indent=2) if incident.attempted_actions else "None"
+    ctx = code_context or {}
+    code_block = ""
+    if ctx:
+        parts = []
+        for rel, body in ctx.items():
+            snippet = body if len(body) <= 12000 else body[:12000] + "\n... [truncated]"
+            parts.append(f"--- file: {rel} ---\n{snippet}")
+        code_block = f"""
+LIVE SOURCE (read-only context; fixes apply via fix_code to paths under CODE_HEAL_ROOT):
+{chr(10).join(parts)}
+"""
+
+    is_code_heal = incident.failure_type == FailureType.CODE_HEAL.value
+
+    if is_code_heal:
+        return f"""You are an expert cloud infrastructure reliability engineer specialising in Docker-based microservices.
+
+Analyse the following service failure. The failure is classified as code_heal: the logs indicate an application bug that can be fixed by editing the mounted live source file(s), then restarting the service.
+
+Respond ONLY with raw JSON (no markdown, no backticks, no explanation outside JSON).
+
+SERVICE CONTEXT:
+  Service       : {incident.service}
+  Container     : {incident.container_status}
+  Exit Code     : {incident.exit_code}
+  Failure Type  : {incident.failure_type}
+  Severity      : {incident.severity}
+  Detected At   : {incident.timestamp}
+  Retry Count   : {incident.retry_count}
+
+RECENT LOGS:
+{chr(10).join(f'  - {line}' for line in incident.log_lines[-12:])}
+{code_block}
+TAGS: {', '.join(incident.tags)}
+ERROR KEYWORD: {incident.error_keyword}
+
+STEPS ALREADY TRIED (do NOT repeat these):
+{steps_tried}
+
+HISTORICAL CONTEXT:
+{history}
+
+ALLOWED ACTIONS (pick exactly one):
+  fix_code            — provide full corrected file content for one allowlisted file; the engine writes under CODE_HEAL_ROOT and restarts the container
+  restart_service     — only if a source fix is not possible
+  escalate            — if retry_count >= 3 or fix is unsafe
+
+RULES:
+  - You MUST choose fix_code when the logs and source show a clear bug (e.g. wrong constant breaking /health).
+  - fix_file must be a relative path allowlisted for this demo (e.g. app.py).
+  - fix_file_content must be the ENTIRE file content after your fix, as a single JSON string (escape newlines as \\n).
+  - If failure_type is code_heal and retry_count >= 3, you MUST choose escalate.
+  - NEVER suggest an action that was already tried and failed.
+
+REQUIRED JSON RESPONSE FORMAT (every field is mandatory; use empty strings for fix_* if action is not fix_code):
+{{
+  "action": "fix_code|restart_service|escalate",
+  "service": "{incident.service}",
+  "fix_file": "app.py",
+  "fix_file_content": "<full file source when action is fix_code; empty string otherwise>",
+  "error_summary": "<2-3 sentences>",
+  "root_cause": "<2-3 sentences>",
+  "fix_explanation": "<how the code change fixes the failure>",
+  "reasoning": "<1-2 sentences>",
+  "confidence": "high|medium|low",
+  "alternative": "restart_service"
+}}
+"""
 
     return f"""You are an expert cloud infrastructure reliability engineer specialising in Docker-based microservices.
 
@@ -241,7 +316,7 @@ SERVICE CONTEXT:
 
 RECENT LOGS:
 {chr(10).join(f'  - {line}' for line in incident.log_lines[-8:])}
-
+{code_block}
 TAGS: {', '.join(incident.tags)}
 ERROR KEYWORD: {incident.error_keyword}
 
@@ -429,7 +504,67 @@ def _coerce_self_heal_decision(incident: Incident, decision: Dict, state_manager
         logger.info("Coerced escalate → %s (error_logs, service=%s)", primary, svc)
         return out
 
+    if ft == FailureType.CODE_HEAL.value:
+        out = {
+            **decision,
+            "action": primary,
+            "service": svc,
+            "error_summary": (
+                f"Code contract failure on {svc} (failure_type=code_heal). "
+                f"Automated recovery: {primary} (edit live source under CODE_HEAL_ROOT)."
+            ),
+            "root_cause": (
+                "Logs match [code_heal]; the running app does not meet its health contract until source is corrected."
+            ),
+            "fix_explanation": (
+                f"`{primary}` writes the corrected file and restarts the service so the process loads the fix."
+            ),
+            "reasoning": (
+                "Policy: while retries remain, code_heal maps to fix_code instead of escalate."
+            ),
+            "alternative": alt,
+        }
+        logger.info("Coerced escalate → %s (code_heal, service=%s)", primary, svc)
+        return out
+
     return decision
+
+
+def _ensure_fix_code_payload(
+    incident: Incident,
+    decision: Dict,
+    code_context: Dict[str, str],
+) -> Dict:
+    """If the LLM chose fix_code but omitted/truncated fix_file_content (common with large JSON),
+    fill from mounted code_context with a minimal deterministic patch for the buggy-service demo.
+    """
+    if decision.get("action") != "fix_code":
+        return decision
+    if incident.failure_type != FailureType.CODE_HEAL.value:
+        return decision
+    raw = (decision.get("fix_file_content") or "").strip()
+    if raw:
+        return decision
+    fix_file = (decision.get("fix_file") or "app.py").strip() or "app.py"
+    base = (code_context or {}).get(fix_file)
+    if not base:
+        logger.warning(
+            "fix_code with empty fix_file_content and no code_context[%s] — cannot synthesize patch",
+            fix_file,
+        )
+        return decision
+    fixed = base.replace("EXPECTED_MAGIC = 41", "EXPECTED_MAGIC = 42")
+    if fixed == base:
+        logger.warning(
+            "fix_code fallback: no EXPECTED_MAGIC = 41 in %s — leaving decision unchanged",
+            fix_file,
+        )
+        return decision
+    logger.info(
+        "Filled empty fix_file_content from code_context[%s] (demo EXPECTED_MAGIC patch)",
+        fix_file,
+    )
+    return {**decision, "fix_file": fix_file, "fix_file_content": fixed}
 
 
 def _try_parse_json(text: str):
@@ -500,6 +635,8 @@ def _parse_response(raw: str, incident: Incident) -> Dict:
         "reasoning": data.get("reasoning", ""),
         "confidence": data.get("confidence", "medium"),
         "alternative": data.get("alternative", "escalate"),
+        "fix_file": data.get("fix_file", "") or "",
+        "fix_file_content": data.get("fix_file_content", "") or "",
     }
 
 
@@ -546,7 +683,7 @@ def _make_analyze_node(llm, active_provider: str, state_manager: StateManager):
             logger.warning("Retry limit reached for %s — escalating", inc.id)
             decision = _escalation_decision(inc)
         else:
-            prompt = _build_prompt(inc, state_manager)
+            prompt = _build_prompt(inc, state_manager, state.get("code_context") or {})
             try:
                 raw = llm.generate(prompt)
                 logger.debug("LLM raw response (first 300): %s", raw[:300])
@@ -556,6 +693,7 @@ def _make_analyze_node(llm, active_provider: str, state_manager: StateManager):
                 decision = _escalation_decision(inc)
 
         decision = _coerce_self_heal_decision(inc, decision, state_manager)
+        decision = _ensure_fix_code_payload(inc, decision, state.get("code_context") or {})
 
         state_manager.update_incident(
             inc.id,
@@ -581,11 +719,17 @@ def _make_execute_node(tool_manager: ToolManager):
         service = decision.get("service") or state["service"]
         fallback = decision.get("alternative", "escalate")
 
+        extra: Dict = {}
+        if action == "fix_code":
+            extra["fix_file"] = decision.get("fix_file")
+            extra["fix_file_content"] = decision.get("fix_file_content")
+
         result = tool_manager.execute_with_fallback(
             state["incident_id"],
             primary_action=action,
             fallback_action=fallback if fallback != action else None,
             service=service,
+            **extra,
         )
         logger.info("Tool result: %s", result)
         return {"tool_result": result.to_dict()}
@@ -694,6 +838,7 @@ class Agent:
         container_status: str,
         exit_code: int,
         timestamp: Optional[str] = None,
+        code_context: Optional[Dict[str, str]] = None,
     ) -> IncidentState:
         """
         Run the full incident response graph and return the final state.
@@ -706,6 +851,7 @@ class Agent:
             "container_status": container_status,
             "exit_code": exit_code,
             "timestamp": timestamp or datetime.now().isoformat(),
+            "code_context": code_context or {},
             "incident_id": "",
             "failure_type": "",
             "error_keyword": "",

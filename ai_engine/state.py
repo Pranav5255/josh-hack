@@ -30,6 +30,7 @@ class IncidentStatus(Enum):
 class FailureType(Enum):
     DB_DOWN         = "db_down"
     DB_APP_ESCALATE = "db_app_escalate"  # app-level DB issue → human-in-the-loop (see HIL_DB_DEMO markers)
+    CODE_HEAL       = "code_heal"  # [code_heal] in logs — edit live source under CODE_HEAL_ROOT
     SERVICE_DOWN    = "service_down"
     ERROR_LOGS      = "error_logs"
     UNKNOWN         = "unknown"
@@ -43,6 +44,7 @@ KNOWN_SERVICES = [
     "order-service",
     "user-service",
     "hil-db-demo",
+    "buggy-service",
 ]
 
 # ---------------------------------------------------------------------------
@@ -116,6 +118,11 @@ DB_APP_ESCALATE_MARKERS = [
     "db_app_escalate:",
 ]
 
+# Emitted by buggy-service when /health fails contract (see seed/app.py)
+CODE_HEAL_MARKERS = [
+    "[code_heal]",
+]
+
 DB_KEYWORDS = [
     "connection refused", "connection timeout", "connection reset",
     "database", "postgres", "mysql", "mongodb", "redis",
@@ -152,6 +159,17 @@ def classify_failure(
             keyword,
             "critical",
             ["database", "human_escalation", "hil_db_demo"],
+        )
+
+    # 0b) CODE_HEAL — application bug fixable by editing mounted source (before DB_DOWN / ERROR_LOGS)
+    if any(m in logs_lower for m in CODE_HEAL_MARKERS):
+        keyword = next((m for m in CODE_HEAL_MARKERS if m in logs_lower), "code_heal")
+        logger.info("Classified as CODE_HEAL (marker=%s)", keyword)
+        return (
+            FailureType.CODE_HEAL.value,
+            keyword,
+            "high",
+            ["code_heal", "source_edit"],
         )
 
     # 1) DB_DOWN — connection / database keywords

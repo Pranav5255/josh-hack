@@ -7,6 +7,7 @@ const services = [
     'payment-service',
     'gateway-service',
     'hil-db-demo',
+    'buggy-service',
 ];
 
 let channel = null;

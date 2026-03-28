@@ -9,6 +9,7 @@
 import json
 import logging
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
@@ -17,7 +18,7 @@ from ai_engine.state import (
     StateManager, classify_failure, KNOWN_SERVICES,
 )
 from ai_engine.agent import Agent, ALLOWED_ACTIONS, IncidentState
-from ai_engine.tools import ToolManager, ACTION_MAP, ToolResult
+from ai_engine.tools import ToolManager, ACTION_MAP, ToolResult, fix_code
 
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s [%(name)s] %(levelname)s %(message)s")
 
@@ -54,13 +55,35 @@ class FakeLLM:
             "service_down": ("restart_service",  "Service container has crashed."),
             "error_logs":   ("restart_service",  "Application errors detected in running container."),
         }
-        action, summary = action_map.get(failure_type, ("escalate", "Unknown failure."))
 
         service = "payment-service"
         for svc in KNOWN_SERVICES:
             if svc in prompt:
                 service = svc
                 break
+
+        if failure_type == "code_heal":
+            seed = Path(__file__).resolve().parent.parent / "buggy-service" / "seed" / "app.py"
+            try:
+                fixed = seed.read_text(encoding="utf-8").replace(
+                    "EXPECTED_MAGIC = 41", "EXPECTED_MAGIC = 42",
+                )
+            except OSError:
+                fixed = "EXPECTED_MAGIC = 42\n"
+            return json.dumps({
+                "action": "fix_code",
+                "service": service,
+                "fix_file": "app.py",
+                "fix_file_content": fixed,
+                "error_summary": "[code_heal] health contract failure — wrong magic constant.",
+                "root_cause": "EXPECTED_MAGIC must match service contract (42).",
+                "fix_explanation": "Set EXPECTED_MAGIC to 42 and restart the service.",
+                "reasoning": "code_heal requires fix_code with full file content.",
+                "confidence": "high",
+                "alternative": "restart_service",
+            })
+
+        action, summary = action_map.get(failure_type, ("escalate", "Unknown failure."))
 
         return json.dumps({
             "action": action,
@@ -197,6 +220,15 @@ class TestClassifier:
         )
         assert ft == FailureType.DB_APP_ESCALATE.value
         assert "human_escalation" in tags
+
+    def test_code_heal_marker(self):
+        ft, kw, sev, tags = classify_failure(
+            ["[code_heal] health failed: EXPECTED_MAGIC=41"],
+            "running",
+            0,
+        )
+        assert ft == FailureType.CODE_HEAL.value
+        assert "code_heal" in tags
 
 
 # =====================================================================
@@ -400,8 +432,19 @@ class TestTools:
             FailureType.DB_DOWN,
             FailureType.SERVICE_DOWN,
             FailureType.ERROR_LOGS,
+            FailureType.CODE_HEAL,
         ]:
             assert ft.value in ACTION_MAP, f"Missing ACTION_MAP entry for {ft.value}"
+
+    def test_fix_code_rejects_path_outside_root(self):
+        r = fix_code(
+            "buggy-service",
+            dry_run=True,
+            fix_file="../etc/passwd",
+            fix_file_content="x",
+        )
+        assert r.success is False
+        assert r.error
 
 
 # =====================================================================
@@ -488,6 +531,20 @@ class TestFullLangGraphPipeline:
         assert result["healed"] is False
         inc = state_manager.get_incident(result["incident_id"])
         assert inc.status == IncidentStatus.ESCALATED
+
+    def test_code_heal_full_pipeline(self, state_manager, tool_manager):
+        agent = _make_agent(state_manager, tool_manager)
+        result = agent.run(
+            service="buggy-service",
+            log_lines=["[code_heal] health failed: EXPECTED_MAGIC=41 but service contract requires 42"],
+            container_status="running",
+            exit_code=0,
+        )
+        assert result["failure_type"] == "code_heal"
+        assert result["decision"]["action"] == "fix_code"
+        assert result["tool_result"]["success"] is True
+        assert result["healed"] is True
+        assert result["final_status"] == IncidentStatus.HEALED.value
 
     def test_multiple_incidents_isolated(self, state_manager, tool_manager):
         """Two concurrent incidents should not interfere with each other."""

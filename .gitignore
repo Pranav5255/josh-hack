@@ -8,3 +8,6 @@ vertex-ai-key.json
 __pycache__/
 .pytest_cache/
 status.json
+
+# Code-heal demo — live copy is reset from seed in the container; do not commit AI edits
+buggy-service/live/app.py

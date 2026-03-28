@@ -45,6 +45,16 @@ services:
       - HIL_DEMO_INTERVAL_SEC=${HIL_DEMO_INTERVAL_SEC:-120}
     restart: always
 
+  # Code-heal demo — Flask app with intentional bug; seed→live reset on each container start
+  buggy-service:
+    build: ./buggy-service
+    container_name: buggy-service
+    ports:
+      - "3010:3010"
+    volumes:
+      - ./buggy-service/live:/app/live
+    restart: always
+
   # ---------------------------------------------------------------------------
   # Message broker
   # ---------------------------------------------------------------------------
@@ -70,6 +80,7 @@ services:
       - payment-service
       - gateway-service
       - hil-db-demo
+      - buggy-service
       - rabbitmq
     restart: always
 
@@ -141,16 +152,23 @@ services:
       # Explicit paths if PATH is ever stripped (image sets /usr/local/bin/docker + docker-compose)
       - DOCKER_BIN=${DOCKER_BIN:-docker}
       - DOCKER_COMPOSE_BIN=${DOCKER_COMPOSE_BIN:-docker-compose}
+      # Code-heal prototype: shared live source + HTTP verify (same host dir as buggy-service)
+      - CODE_HEAL_ROOT=${CODE_HEAL_ROOT:-/buggy-live}
+      - CODE_HEAL_FILES=${CODE_HEAL_FILES:-app.py}
+      - CODE_HEAL_SERVICES=${CODE_HEAL_SERVICES:-buggy-service}
+      - BUGGY_SERVICE_HEALTH_URL=${BUGGY_SERVICE_HEALTH_URL:-http://buggy-service:3010/health}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       # Mount Vertex AI service account JSON (must be a file). Wrong/missing host path → Docker creates a directory and Vertex fails with "Is a directory".
       - ./vertex-ai-key.json:/app/vertex-ai-key.json:ro
+      - ./buggy-service/live:/buggy-live
     ports:
       - "4000:4000"
     depends_on:
       - rabbitmq
       - log-collector
       - mail-service
+      - buggy-service
     restart: always
 
   # ---------------------------------------------------------------------------

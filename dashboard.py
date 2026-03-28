@@ -111,12 +111,21 @@ _FAILURE_KEYWORDS = [
     "segmentation fault", "timeout", "crashed", "killed",
 ]
 
+# Beyond _FAILURE_KEYWORDS: app- and framework-specific signals that classify as failures
+# but do not contain words like "error". Align [code_heal] with ai_engine.state.CODE_HEAL_MARKERS.
+# Werkzeug dev access lines end with: ... HTTP/1.1" 500 -
+_ANALYSIS_EXTRA_MARKERS = (
+    "[code_heal]",
+    " 500 -",
+)
+
 _ACTION_COMMANDS = {
     "restart_service":     "docker restart {service}",
     "restart_database":    "docker restart {service}-db",
     "rollback_deployment": "docker-compose up -d --force-recreate {service}",
     "scale_replicas":      "docker-compose up -d --scale {service}=3",
     "check_logs":          "docker logs --tail 50 {service}",
+    "fix_code":            "write allowlisted file under CODE_HEAL_ROOT + docker restart {service}",
     "escalate":            "# Manual intervention required for {service}",
 }
 
@@ -132,6 +141,7 @@ _state = {
         "payment-service": {"status": "unknown", "exitCode": None, "lastSeen": None},
         "gateway-service": {"status": "unknown", "exitCode": None, "lastSeen": None},
         "hil-db-demo":      {"status": "unknown", "exitCode": None, "lastSeen": None},
+        "buggy-service":    {"status": "unknown", "exitCode": None, "lastSeen": None},
     },
 }
 _state_lock = threading.Lock()
@@ -475,12 +485,25 @@ def _get_agent():
 # ---------------------------------------------------------------------------
 def _needs_analysis(logobj: dict) -> bool:
     exit_code = logobj.get("exit_code")
+    lines = logobj.get("logs", [])
     if exit_code not in (0, None):
         return True
-    for line in logobj.get("logs", []):
-        if any(kw in line.lower() for kw in _FAILURE_KEYWORDS):
-            return True
-    return False
+    matched_kw = None
+    for line in lines:
+        low = line.lower()
+        for marker in _ANALYSIS_EXTRA_MARKERS:
+            if marker in low:
+                matched_kw = marker
+                break
+        if matched_kw:
+            break
+        for kw in _FAILURE_KEYWORDS:
+            if kw in low:
+                matched_kw = kw
+                break
+        if matched_kw:
+            break
+    return matched_kw is not None
 
 
 def _in_cooldown(service: str) -> bool:
@@ -491,6 +514,28 @@ def _set_cooldown(service: str):
     _cooldown[service] = time.time()
 
 
+def _code_heal_service_names() -> set:
+    raw = os.getenv("CODE_HEAL_SERVICES", "buggy-service")
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+
+def _load_code_context(service: str) -> dict:
+    """Read allowlisted files under CODE_HEAL_ROOT for the agent prompt (same paths ai-engine may write)."""
+    if service not in _code_heal_service_names():
+        return {}
+    root = os.getenv("CODE_HEAL_ROOT", "/buggy-live")
+    files = [f.strip() for f in os.getenv("CODE_HEAL_FILES", "app.py").split(",") if f.strip()]
+    out = {}
+    for rel in files:
+        path = os.path.join(root, rel.replace("\\", "/").lstrip("/"))
+        try:
+            with open(path, encoding="utf-8") as fp:
+                out[rel] = fp.read()
+        except OSError:
+            logger.debug("code_context: skip missing or unreadable %s", path)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Analysis thread: calls agent.run(), emits rca_event, sends email
 # ---------------------------------------------------------------------------
@@ -498,12 +543,14 @@ def _run_analysis(logobj: dict) -> None:
     service = logobj.get("service", "unknown")
     try:
         agent  = _get_agent()
+        code_ctx = _load_code_context(service)
         result = agent.run(
             service=service,
             log_lines=logobj.get("logs", []),
             container_status=logobj.get("container_status", "unknown"),
             exit_code=int(logobj.get("exit_code") or 0),
             timestamp=logobj.get("timestamp"),
+            code_context=code_ctx,
         )
 
         decision = result.get("decision", {})
